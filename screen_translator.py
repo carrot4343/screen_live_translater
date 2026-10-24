@@ -654,6 +654,7 @@ class ScreenTranslator:
         self._build_ui()
         self._load_config()
         self.refresh_windows()
+        self._on_scr_mode_changed()
         self.refresh_audio_sessions()
         self._refresh_quota_ui()
 
@@ -705,26 +706,48 @@ class ScreenTranslator:
 
         self.scr_mode_var = tk.StringVar(value="display")
         tk.Radiobutton(
-            rs1, text="전체 디스플레이 영역", variable=self.scr_mode_var, value="display", bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244"
+            rs1,
+            text="전체 디스플레이 영역",
+            variable=self.scr_mode_var,
+            value="display",
+            command=self._on_scr_mode_changed,
+            bg="#1e1e2e",
+            fg="#cdd6f4",
+            selectcolor="#313244",
         ).pack(side="left", padx=8)
         tk.Radiobutton(
-            rs1, text="지정 애플리케이션 창", variable=self.scr_mode_var, value="window", bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244"
+            rs1,
+            text="지정 애플리케이션 창",
+            variable=self.scr_mode_var,
+            value="window",
+            command=self._on_scr_mode_changed,
+            bg="#1e1e2e",
+            fg="#cdd6f4",
+            selectcolor="#313244",
         ).pack(side="left", padx=4)
 
         rs2 = tk.Frame(frm_scr, bg="#1e1e2e")
         rs2.pack(fill="x", padx=8, pady=4)
         tk.Label(rs2, text="대상 창:", bg="#1e1e2e", fg="#cdd6f4").pack(side="left")
         self.win_combo_var = tk.StringVar()
-        self.win_combo = ttk.Combobox(rs2, textvariable=self.win_combo_var, state="readonly", width=36)
+        self.win_combo = ttk.Combobox(rs2, textvariable=self.win_combo_var, state="disabled", width=30)
         self.win_combo.pack(side="left", padx=6)
         self.win_combo.bind("<<ComboboxSelected>>", self._on_window_selected)
-        tk.Button(rs2, text="창 새로고침", command=self.refresh_windows, bg="#585b70", fg="white", relief="flat").pack(side="left", padx=3)
+        self.btn_win_refresh = tk.Button(
+            rs2, text="창 새로고침", command=self.refresh_windows, bg="#585b70", fg="white", relief="flat", state="disabled"
+        )
+        self.btn_win_refresh.pack(side="left", padx=2)
+        self.btn_win_full = tk.Button(
+            rs2, text="창 전체로 초기화", command=self._reset_to_full_window, bg="#585b70", fg="white", relief="flat", state="disabled"
+        )
+        self.btn_win_full.pack(side="left", padx=2)
 
         rs3 = tk.Frame(frm_scr, bg="#1e1e2e")
         rs3.pack(fill="x", padx=8, pady=4)
-        tk.Button(rs3, text="📐 영역 드래그 지정", command=self.select_region, bg="#89b4fa", fg="#11111b", relief="flat").pack(
-            side="left", padx=2
+        self.btn_select_region = tk.Button(
+            rs3, text="📐 모니터 화면 영역 드래그", command=self.select_region, bg="#89b4fa", fg="#11111b", relief="flat"
         )
+        self.btn_select_region.pack(side="left", padx=2)
         tk.Button(rs3, text="⚡ 1회 즉시 번역", command=lambda: self.trigger_screen_once(force=True), bg="#f9e2af", fg="#11111b", relief="flat").pack(
             side="left", padx=6
         )
@@ -732,7 +755,9 @@ class ScreenTranslator:
         self.scr_interval_var = tk.DoubleVar(value=1.5)
         tk.Spinbox(rs3, from_=0.8, to=10.0, increment=0.5, textvariable=self.scr_interval_var, width=5).pack(side="left")
 
-        self.lbl_scr_status = tk.Label(frm_scr, text="영역 미지정 (영역 드래그 지정 또는 대상 창을 선택하세요)", bg="#1e1e2e", fg="#a6adc8", anchor="w")
+        self.lbl_scr_status = tk.Label(
+            frm_scr, text="[전체 디스플레이 모드] '📐 모니터 화면 영역 드래그'를 눌러 번역할 영역을 지정하세요.", bg="#1e1e2e", fg="#a6adc8", anchor="w"
+        )
         self.lbl_scr_status.pack(fill="x", padx=8, pady=(0, 4))
 
         # --- 3) 오디오 사용 프로그램 & 크롬 탭 번역 설정 ---
@@ -919,6 +944,30 @@ class ScreenTranslator:
     # -----------------------------------------------------------------
     # 창 목록 및 영역 지정
     # -----------------------------------------------------------------
+    def _on_scr_mode_changed(self):
+        self.prev_small = None
+        if self.scr_mode_var.get() == "window":
+            self.win_combo.config(state="readonly")
+            self.btn_win_refresh.config(state="normal")
+            self.btn_win_full.config(state="normal")
+            self.btn_select_region.config(text="📐 선택한 창 내부 일부만 드래그")
+            if not self.target_hwnd and self.window_list:
+                self.win_combo.current(0)
+                self._on_window_selected()
+            elif self.target_hwnd:
+                self._update_window_status_label()
+            else:
+                self.lbl_scr_status.config(text="[지정 창 모드] 대상 창을 드롭다운에서 선택하세요.")
+        else:
+            self.win_combo.config(state="disabled")
+            self.btn_win_refresh.config(state="disabled")
+            self.btn_win_full.config(state="disabled")
+            self.btn_select_region.config(text="📐 모니터 화면 영역 드래그")
+            if self.abs_bbox:
+                self.lbl_scr_status.config(text=f"[전체 디스플레이 모드] 드래그 지정된 영역: {self.abs_bbox}")
+            else:
+                self.lbl_scr_status.config(text="[전체 디스플레이 모드] '📐 모니터 화면 영역 드래그'를 눌러 번역할 영역을 지정하세요.")
+
     def refresh_windows(self):
         exclude = ("Gemini 3.8 Flash 실시간 번역기", "번역 결과 창")
         self.window_list = list_visible_windows(exclude_titles=exclude)
@@ -926,18 +975,44 @@ class ScreenTranslator:
         self.win_combo["values"] = items
         if items and not self.win_combo_var.get():
             self.win_combo.current(0)
-            self._on_window_selected()
+            idx = 0
+            hwnd, _title, rect = self.window_list[idx]
+            self.target_hwnd = hwnd
+            self.rel_bbox = (0, 0, rect[2] - rect[0], rect[3] - rect[1])
 
     def _on_window_selected(self, _event=None):
         idx = self.win_combo.current()
         if 0 <= idx < len(self.window_list):
-            hwnd, title, rect = self.window_list[idx]
+            hwnd, _title, rect = self.window_list[idx]
             self.target_hwnd = hwnd
             w = rect[2] - rect[0]
             h = rect[3] - rect[1]
             self.rel_bbox = (0, 0, w, h)
             self.prev_small = None
-            self.lbl_scr_status.config(text=f"선택 창: {title} ({w}x{h}) — 필요 시 [영역 드래그 지정]으로 창 일부만 선택 가능")
+            if self.scr_mode_var.get() != "window":
+                self.scr_mode_var.set("window")
+                self._on_scr_mode_changed()
+            else:
+                self._update_window_status_label()
+
+    def _reset_to_full_window(self):
+        if self.target_hwnd:
+            rect = get_window_rect(self.target_hwnd)
+            if rect:
+                self.rel_bbox = (0, 0, rect[2] - rect[0], rect[3] - rect[1])
+                self.prev_small = None
+                self._update_window_status_label()
+
+    def _update_window_status_label(self):
+        idx = self.win_combo.current()
+        title = self.window_list[idx][1] if 0 <= idx < len(self.window_list) else str(self.target_hwnd)
+        rect = get_window_rect(self.target_hwnd) if self.target_hwnd else None
+        if rect and self.rel_bbox == (0, 0, rect[2] - rect[0], rect[3] - rect[1]):
+            self.lbl_scr_status.config(
+                text=f"[지정 창 모드] '{title}' 창 전체 ({rect[2]-rect[0]}x{rect[3]-rect[1]}) — 일부만 지정하려면 드래그 버튼 클릭"
+            )
+        else:
+            self.lbl_scr_status.config(text=f"[지정 창 모드] '{title}' 창 내부 상대 영역: {self.rel_bbox}")
 
     def select_region(self):
         # 다중 디스플레이: -fullscreen은 한 모니터만 덮으므로 가상 데스크톱 전체를 덮는 테두리 없는 창 사용
@@ -973,10 +1048,10 @@ class ScreenTranslator:
                     wrect = get_window_rect(self.target_hwnd)
                     if wrect:
                         self.rel_bbox = (x1 - wrect[0], y1 - wrect[1], x2 - wrect[0], y2 - wrect[1])
-                        self.lbl_scr_status.config(text=f"창 기준 상대 영역 설정됨: {self.rel_bbox}")
+                        self._update_window_status_label()
                         return
                 self.abs_bbox = (x1, y1, x2, y2)
-                self.lbl_scr_status.config(text=f"디스플레이 영역 설정됨: {self.abs_bbox}")
+                self.lbl_scr_status.config(text=f"[전체 디스플레이 모드] 드래그 지정된 영역: {self.abs_bbox}")
 
         canvas.bind("<ButtonPress-1>", on_down)
         canvas.bind("<B1-Motion>", on_drag)
@@ -1052,7 +1127,7 @@ class ScreenTranslator:
                     {"type": "image", "data": b64, "mime_type": "image/jpeg"},
                     {"type": "text", "text": prompt},
                 ],
-                generation_config={"thinking_level": "minimal"},
+                generation_config={"thinking_level": "low"},
                 stream=True,
                 store=False,
             )
@@ -1070,10 +1145,10 @@ class ScreenTranslator:
                         int(getattr(u, "total_tokens", 0) or 0),
                     )
             dt = time.perf_counter() - t0
-            self.root.after(0, lambda: self.lbl_scr_status.config(text=f"화면 번역 완료 ({dt:.2f}초)"))
+            self.root.after(0, lambda d=dt: self.lbl_scr_status.config(text=f"화면 번역 완료 ({d:.2f}초)"))
             self.root.after(0, self._refresh_quota_ui)
         except Exception as e:
-            self.root.after(0, lambda: self.lbl_scr_status.config(text=f"API 오류: {e}"))
+            self.root.after(0, lambda err=e: self.lbl_scr_status.config(text=f"API 오류: {err}"))
         finally:
             self.screen_busy = False
 
@@ -1162,7 +1237,7 @@ class ScreenTranslator:
                     {"type": "audio", "data": wav_b64, "mime_type": "audio/wav"},
                     {"type": "text", "text": prompt},
                 ],
-                generation_config={"thinking_level": "minimal"},
+                generation_config={"thinking_level": "low"},
                 stream=True,
                 store=False,
             )
