@@ -81,6 +81,16 @@ def get_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     return (rect.left, rect.top, rect.right, rect.bottom)
 
 
+def get_virtual_screen() -> tuple[int, int, int, int]:
+    """모든 모니터를 합친 가상 데스크톱 (x, y, w, h). 보조 모니터가 왼쪽/위쪽이면 x, y가 음수"""
+    return (
+        user32.GetSystemMetrics(76),  # SM_XVIRTUALSCREEN
+        user32.GetSystemMetrics(77),  # SM_YVIRTUALSCREEN
+        user32.GetSystemMetrics(78),  # SM_CXVIRTUALSCREEN
+        user32.GetSystemMetrics(79),  # SM_CYVIRTUALSCREEN
+    )
+
+
 def list_visible_windows(exclude_titles: tuple[str, ...] = ()) -> list[tuple[int, str, tuple[int, int, int, int]]]:
     """현재 화면에 표시 중인 유효한 애플리케이션 창 목록 반환: [(hwnd, title, rect), ...]"""
     results: list[tuple[int, str, tuple[int, int, int, int]]] = []
@@ -930,13 +940,17 @@ class ScreenTranslator:
             self.lbl_scr_status.config(text=f"선택 창: {title} ({w}x{h}) — 필요 시 [영역 드래그 지정]으로 창 일부만 선택 가능")
 
     def select_region(self):
+        # 다중 디스플레이: -fullscreen은 한 모니터만 덮으므로 가상 데스크톱 전체를 덮는 테두리 없는 창 사용
+        vx, vy, vw, vh = get_virtual_screen()
         sel = tk.Toplevel(self.root)
-        sel.attributes("-fullscreen", True)
+        sel.overrideredirect(True)
+        sel.geometry(f"{vw}x{vh}+{vx}+{vy}")
         sel.attributes("-alpha", 0.3)
         sel.attributes("-topmost", True)
         sel.config(cursor="cross")
         canvas = tk.Canvas(sel, bg="black", highlightthickness=0)
         canvas.pack(fill="both", expand=True)
+        sel.focus_force()
 
         state = {"x0": 0, "y0": 0, "rect": None}
 
@@ -946,7 +960,8 @@ class ScreenTranslator:
 
         def on_drag(e):
             if state["rect"]:
-                canvas.coords(state["rect"], state["x0"], state["y0"], e.x_root, e.y_root)
+                # 캔버스 좌표 = 화면 절대좌표 - 가상화면 원점
+                canvas.coords(state["rect"], state["x0"] - vx, state["y0"] - vy, e.x, e.y)
 
         def on_up(e):
             x1, x2 = sorted([state["x0"], e.x_root])
