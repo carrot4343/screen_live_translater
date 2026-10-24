@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+*.log
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Sensitive API Keys & Local Configurations
+translator_config.json
+token_usage.json
+.env
+
+# OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store
