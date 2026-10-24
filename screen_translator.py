@@ -1172,7 +1172,13 @@ class ScreenTranslator:
 
     def _get_client(self, key: str) -> genai.Client:
         if self._cached_client is None or self._cached_client_key != key:
-            self._cached_client = genai.Client(api_key=key)
+            c = genai.Client(api_key=key, http_options={"retry_options": {"attempts": 1}})
+            try:
+                # 429(일일 할당량 초과 등) 발생 시 SDK 내부의 Retry-After(수천 초 대기)를 비활성화하여 즉시 폴백
+                c.interactions.sdk_configuration.retry_config = None
+            except Exception:
+                pass
+            self._cached_client = c
             self._cached_client_key = key
         return self._cached_client
 
@@ -1183,7 +1189,7 @@ class ScreenTranslator:
             generation_config={"thinking_level": get_thinking_level(model)},
             stream=True,
             store=False,
-            timeout=6000,
+            timeout=3.5 if model == "gemini-3.8-flash" else 8.0,
         )
         first = True
         collected: list[str] = []
