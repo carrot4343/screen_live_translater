@@ -52,18 +52,67 @@ TIER_PRESETS = {
 
 
 # =====================================================================
-# 1. 화면 픽셀 변화 감지 & 이미지 인코딩
+# 1. 화면 픽셀 변화 감지 & 로컬 초고속 텍스트 추출 (무료 OCR)
 # =====================================================================
+_RAPID_OCR = None
+_WINOCR_LANGS: list[str] | None = None
+
+
+def get_thinking_level(model_name: str) -> str:
+    """flash-lite 계열은 추론 지연이 없는 'minimal'을, 3.8-flash 및 4-argon은 'low'를 사용"""
+    m = model_name.lower()
+    if "lite" in m or "3.6" in m:
+        return "minimal"
+    return "low"
+
+
 def encode_And_diff(img: Image.Image, prev_small: Image.Image | None, threshold: float = 3.5):
-    """# ponytail: 32x32 저해상도 픽셀 평균 차이로 화면 변경 감지, 로컬 OCR이 필요할 때 교체"""
+    """32x32 저해상도 픽셀 평균 차이로 1차 화면 변경 감지"""
     small = img.resize((32, 32)).convert("L")
     changed = True
     if prev_small is not None:
         diff = ImageStat.Stat(ImageChops.difference(small, prev_small)).mean[0]
         changed = diff >= threshold
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=82)
+    img.convert("RGB").save(buf, format="JPEG", quality=75)
     return base64.b64encode(buf.getvalue()).decode("ascii"), small, changed
+
+
+def extract_text_local(img: Image.Image) -> str:
+    """비용 0원 로컬 OCR: Windows 내장 OCR(~40ms)을 우선 시도하고 필요 시 RapidOCR로 폴백"""
+    global _RAPID_OCR, _WINOCR_LANGS
+    rgb = img.convert("RGB")
+    # 1) Windows 내장 OCR (초고속 ~40ms)
+    try:
+        import winocr
+        from winrt.windows.media.ocr import OcrEngine
+
+        if _WINOCR_LANGS is None:
+            avail = [l.language_tag for l in OcrEngine.available_recognizer_languages]
+            # 영어/한국어/일본어 우선순위 정렬
+            pref = [t for p in ("en", "ko", "ja") for t in avail if t.lower().startswith(p)]
+            _WINOCR_LANGS = pref or avail
+        for lang_tag in _WINOCR_LANGS[:2]:
+            res = winocr.recognize_pil_sync(rgb, lang_tag)
+            txt = (res.get("text") or "").strip()
+            if len(txt) >= 2:
+                return txt
+    except Exception:
+        pass
+
+    # 2) RapidOCR (ONNX 오프라인 다국어 OCR)
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+
+        if _RAPID_OCR is None:
+            _RAPID_OCR = RapidOCR()
+        res, _ = _RAPID_OCR(np.array(rgb), use_cls=False)
+        if res:
+            return "\n".join(item[1] for item in res if item and len(item) > 1 and item[1].strip())
+    except Exception:
+        pass
+    return ""
 
 
 # =====================================================================
@@ -645,6 +694,9 @@ class ScreenTranslator:
         self.screen_busy = False
         self.audio_busy = False
         self.prev_small = None
+        self.prev_ocr_text = ""
+        self._cached_client_key = ""
+        self._cached_client: genai.Client | None = None
 
         # 캡처 영역 (절대 좌표 또는 특정 창 상대 좌표)
         self.abs_bbox: tuple[int, int, int, int] | None = None
@@ -1115,51 +1167,91 @@ class ScreenTranslator:
             return
         self.prev_small = small
         self.screen_busy = True
-        self.lbl_scr_status.config(text=f"{self.model_var.get()} 화면 번역 스트리밍 중...")
-        threading.Thread(target=self._translate_image_worker, args=(key, b64), daemon=True).start()
+        self.lbl_scr_status.config(text="로컬 텍스트 추출(OCR) 및 실시간 번역 중...")
+        threading.Thread(target=self._translate_image_worker, args=(key, img, b64, force), daemon=True).start()
 
-    def _translate_image_worker(self, key: str, b64: str):
+    def _get_client(self, key: str) -> genai.Client:
+        if self._cached_client is None or self._cached_client_key != key:
+            self._cached_client = genai.Client(api_key=key)
+            self._cached_client_key = key
+        return self._cached_client
+
+    def _run_interaction_stream(self, client: genai.Client, model: str, req_input, source: str) -> list[str]:
+        stream = client.interactions.create(
+            model=model,
+            input=req_input,
+            generation_config={"thinking_level": get_thinking_level(model)},
+            stream=True,
+            store=False,
+            timeout=6000,
+        )
+        first = True
+        collected: list[str] = []
+        for event in stream:
+            if event.event_type == "step.delta" and getattr(event.delta, "type", None) == "text":
+                chunk = event.delta.text or ""
+                if chunk:
+                    collected.append(chunk)
+                    self.root.after(0, self.overlay.update_content, source, chunk, not first)
+                    first = False
+            elif event.event_type == "interaction.completed":
+                if not collected and getattr(event.interaction, "output_text", None):
+                    txt = event.interaction.output_text
+                    collected.append(txt)
+                    self.root.after(0, self.overlay.update_content, source, txt, False)
+                if getattr(event.interaction, "usage", None):
+                    u = event.interaction.usage
+                    self.quota.record(
+                        int(getattr(u, "total_input_tokens", 0) or 0),
+                        int(getattr(u, "total_output_tokens", 0) or 0),
+                        int(getattr(u, "total_tokens", 0) or 0),
+                    )
+        return collected
+
+    def _translate_image_worker(self, key: str, img: Image.Image, b64: str, force: bool = False):
         t0 = time.perf_counter()
         target_lang = LANGUAGES.get(self.lang_var.get(), "한국어")
-        prompt = f"이미지에 보이는 텍스트를 {target_lang}로만 자연스럽고 정확하게 번역해. 부연 설명 없이 번역문만 출력해."
         try:
-            client = genai.Client(api_key=key)
-            stream = client.interactions.create(
-                model=self.model_var.get().strip(),
-                input=[
+            # 1단계: 내 PC에서 로컬 OCR로 텍스트 초고속 추출 (비용 0원, 토큰 0 소모)
+            ocr_text = extract_text_local(img).strip()
+            t_ocr = time.perf_counter() - t0
+            norm_text = " ".join(ocr_text.split())
+
+            if norm_text:
+                if not force and norm_text == self.prev_ocr_text:
+                    self.root.after(0, lambda: self.lbl_scr_status.config(text=f"텍스트 동일함 (API 호출 생략, OCR {t_ocr:.2f}초)"))
+                    return
+                self.prev_ocr_text = norm_text
+                req_input = f"다음 화면 텍스트를 {target_lang}로만 자연스럽고 정확하게 번역해. 부연 설명 없이 번역문만 출력해:\n{ocr_text}"
+            else:
+                # 로컬 OCR이 특수 폰트 등을 못 읽었을 때만 이미지 비전 입력으로 폴백
+                req_input = [
                     {"type": "image", "data": b64, "mime_type": "image/jpeg"},
-                    {"type": "text", "text": prompt},
-                ],
-                generation_config={"thinking_level": "low"},
-                stream=True,
-                store=False,
-            )
-            first = True
-            collected: list[str] = []
-            for event in stream:
-                if event.event_type == "step.delta" and getattr(event.delta, "type", None) == "text":
-                    chunk = event.delta.text or ""
-                    if chunk:
-                        collected.append(chunk)
-                        self.root.after(0, self.overlay.update_content, "screen", chunk, not first)
-                        first = False
-                elif event.event_type == "interaction.completed":
-                    if not collected and getattr(event.interaction, "output_text", None):
-                        txt = event.interaction.output_text
-                        collected.append(txt)
-                        self.root.after(0, self.overlay.update_content, "screen", txt, False)
-                    if getattr(event.interaction, "usage", None):
-                        u = event.interaction.usage
-                        self.quota.record(
-                            int(getattr(u, "total_input_tokens", 0) or 0),
-                            int(getattr(u, "total_output_tokens", 0) or 0),
-                            int(getattr(u, "total_tokens", 0) or 0),
-                        )
+                    {"type": "text", "text": f"이미지에 보이는 텍스트를 {target_lang}로만 자연스럽고 정확하게 번역해. 부연 설명 없이 번역문만 출력해."},
+                ]
+
+            # 2단계: Gemini 텍스트 번역 스트리밍 (할당량 초과/지연 시 gemini-3.5-flash-lite 자동 폴백)
+            client = self._get_client(key)
+            chosen_model = self.model_var.get().strip()
+            try:
+                collected = self._run_interaction_stream(client, chosen_model, req_input, "screen")
+            except Exception as api_err:
+                if chosen_model != "gemini-3.5-flash-lite":
+                    chosen_model = "gemini-3.5-flash-lite"
+                    self.root.after(0, lambda: self.model_var.set("gemini-3.5-flash-lite"))
+                    collected = self._run_interaction_stream(client, chosen_model, req_input, "screen")
+                else:
+                    raise api_err
+
             dt = time.perf_counter() - t0
             preview = "".join(collected).strip().replace("\n", " ")
-            if len(preview) > 38:
-                preview = preview[:38] + "..."
-            msg = f"✅ 화면 번역 완료 ({dt:.2f}초): {preview}" if preview else f"화면 번역 완료 ({dt:.2f}초) - 감지된 텍스트 없음"
+            if len(preview) > 36:
+                preview = preview[:36] + "..."
+            msg = (
+                f"✅ 번역 완료 ({dt:.2f}초, OCR {t_ocr:.2f}초 | {chosen_model}): {preview}"
+                if preview
+                else f"번역 완료 ({dt:.2f}초) - 감지된 텍스트 없음"
+            )
             self.root.after(0, lambda m=msg: self.lbl_scr_status.config(text=m))
             self.root.after(0, self._refresh_quota_ui)
         except Exception as e:
@@ -1245,33 +1337,23 @@ class ScreenTranslator:
         )
         try:
             self.root.after(0, lambda: self.lbl_aud_status.config(text=f"[{source_label}] 오디오 번역 중..."))
-            client = genai.Client(api_key=key)
-            stream = client.interactions.create(
-                model=self.model_var.get().strip(),
-                input=[
-                    {"type": "audio", "data": wav_b64, "mime_type": "audio/wav"},
-                    {"type": "text", "text": prompt},
-                ],
-                generation_config={"thinking_level": "low"},
-                stream=True,
-                store=False,
-            )
-            first = True
-            for event in stream:
-                if event.event_type == "step.delta" and getattr(event.delta, "type", None) == "text":
-                    chunk = event.delta.text
-                    if chunk.strip() or not first:
-                        self.root.after(0, self.overlay.update_content, "audio", chunk, not first)
-                        first = False
-                elif event.event_type == "interaction.completed" and getattr(event.interaction, "usage", None):
-                    u = event.interaction.usage
-                    self.quota.record(
-                        int(getattr(u, "total_input_tokens", 0) or 0),
-                        int(getattr(u, "total_output_tokens", 0) or 0),
-                        int(getattr(u, "total_tokens", 0) or 0),
-                    )
+            client = self._get_client(key)
+            chosen_model = self.model_var.get().strip()
+            req_input = [
+                {"type": "audio", "data": wav_b64, "mime_type": "audio/wav"},
+                {"type": "text", "text": prompt},
+            ]
+            try:
+                self._run_interaction_stream(client, chosen_model, req_input, "audio")
+            except Exception as api_err:
+                if chosen_model != "gemini-3.5-flash-lite":
+                    chosen_model = "gemini-3.5-flash-lite"
+                    self.root.after(0, lambda: self.model_var.set("gemini-3.5-flash-lite"))
+                    self._run_interaction_stream(client, chosen_model, req_input, "audio")
+                else:
+                    raise api_err
             dt = time.perf_counter() - t0
-            self.root.after(0, lambda: self.lbl_aud_status.config(text=f"[{source_label}] 번역 완료 ({dt:.2f}초)"))
+            self.root.after(0, lambda d=dt, m=chosen_model: self.lbl_aud_status.config(text=f"[{source_label}] 번역 완료 ({d:.2f}초 | {m})"))
             self.root.after(0, self._refresh_quota_ui)
         except Exception as e:
             self.root.after(0, lambda err=e: self.lbl_aud_status.config(text=f"오디오 API 오류: {err}"))
@@ -1358,6 +1440,19 @@ def self_test():
     finally:
         if tmp_usage.exists():
             tmp_usage.unlink()
+
+    # 5. 로컬 OCR 테스트
+    from PIL import ImageDraw, ImageFont
+
+    ocr_img = Image.new("RGB", (420, 70), color=(255, 255, 255))
+    draw = ImageDraw.Draw(ocr_img)
+    try:
+        font = ImageFont.truetype("C:/Windows/Fonts/malgun.ttf", 22)
+    except Exception:
+        font = None
+    draw.text((15, 18), "Hello World 123", fill=(0, 0, 0), font=font)
+    extracted = extract_text_local(ocr_img)
+    assert "Hello" in extracted or "123" in extracted, f"로컬 OCR 추출 실패: {extracted!r}"
 
     print("self_test OK")
 
