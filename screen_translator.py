@@ -607,6 +607,7 @@ class SubtitleOverlayWindow:
         self.win.withdraw()
 
     def update_content(self, source: str, content: str, append: bool = False):
+        self.win.deiconify()
         if source == "screen":
             self.screen_text = (self.screen_text + content) if append else content
         else:
@@ -1049,9 +1050,11 @@ class ScreenTranslator:
                     if wrect:
                         self.rel_bbox = (x1 - wrect[0], y1 - wrect[1], x2 - wrect[0], y2 - wrect[1])
                         self._update_window_status_label()
+                        self.root.after(150, lambda: self.trigger_screen_once(force=True))
                         return
                 self.abs_bbox = (x1, y1, x2, y2)
                 self.lbl_scr_status.config(text=f"[전체 디스플레이 모드] 드래그 지정된 영역: {self.abs_bbox}")
+                self.root.after(150, lambda: self.trigger_screen_once(force=True))
 
         canvas.bind("<ButtonPress-1>", on_down)
         canvas.bind("<B1-Motion>", on_drag)
@@ -1132,20 +1135,32 @@ class ScreenTranslator:
                 store=False,
             )
             first = True
+            collected: list[str] = []
             for event in stream:
                 if event.event_type == "step.delta" and getattr(event.delta, "type", None) == "text":
-                    chunk = event.delta.text
-                    self.root.after(0, self.overlay.update_content, "screen", chunk, not first)
-                    first = False
-                elif event.event_type == "interaction.completed" and getattr(event.interaction, "usage", None):
-                    u = event.interaction.usage
-                    self.quota.record(
-                        int(getattr(u, "total_input_tokens", 0) or 0),
-                        int(getattr(u, "total_output_tokens", 0) or 0),
-                        int(getattr(u, "total_tokens", 0) or 0),
-                    )
+                    chunk = event.delta.text or ""
+                    if chunk:
+                        collected.append(chunk)
+                        self.root.after(0, self.overlay.update_content, "screen", chunk, not first)
+                        first = False
+                elif event.event_type == "interaction.completed":
+                    if not collected and getattr(event.interaction, "output_text", None):
+                        txt = event.interaction.output_text
+                        collected.append(txt)
+                        self.root.after(0, self.overlay.update_content, "screen", txt, False)
+                    if getattr(event.interaction, "usage", None):
+                        u = event.interaction.usage
+                        self.quota.record(
+                            int(getattr(u, "total_input_tokens", 0) or 0),
+                            int(getattr(u, "total_output_tokens", 0) or 0),
+                            int(getattr(u, "total_tokens", 0) or 0),
+                        )
             dt = time.perf_counter() - t0
-            self.root.after(0, lambda d=dt: self.lbl_scr_status.config(text=f"화면 번역 완료 ({d:.2f}초)"))
+            preview = "".join(collected).strip().replace("\n", " ")
+            if len(preview) > 38:
+                preview = preview[:38] + "..."
+            msg = f"✅ 화면 번역 완료 ({dt:.2f}초): {preview}" if preview else f"화면 번역 완료 ({dt:.2f}초) - 감지된 텍스트 없음"
+            self.root.after(0, lambda m=msg: self.lbl_scr_status.config(text=m))
             self.root.after(0, self._refresh_quota_ui)
         except Exception as e:
             self.root.after(0, lambda err=e: self.lbl_scr_status.config(text=f"API 오류: {err}"))
